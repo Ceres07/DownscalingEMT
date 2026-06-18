@@ -1,0 +1,34 @@
+[project]
+name = "topmodel-dispatch-hybrid"
+version = "0.1.0"
+description = "Regression-less scaffold for state-dependent SMIPS soil moisture disaggregation."
+requires-python = ">=3.10"
+dependencies = [
+  "numpy>=1.23",
+]
+
+[project.optional-dependencies]
+calibration = [
+  "pandas>=2",
+  "rasterio>=1.3",
+  "xarray>=2023.1",
+]
+real-data = [
+  "matplotlib>=3.7",
+  "pandas>=2",
+  "rasterio>=1.3",
+  "rioxarray>=0.15",
+  "xarray>=2023.1",
+]
+dev = [
+  "pandas>=2",
+  "pytest>=7",
+  "xarray>=2023.1",
+]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
