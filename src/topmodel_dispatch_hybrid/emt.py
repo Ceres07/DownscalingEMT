@@ -64,7 +64,7 @@ class EMTModel:
     def predict_dataset(
         self,
         terrain: xr.Dataset,
-        mean_moisture: float | pd.DataFrame | None = None,
+        mean_moisture: float | pd.DataFrame | xr.DataArray | None = None,
     ) -> xr.DataArray:
         """Predict a full-grid EMT soil-moisture field."""
 
@@ -74,10 +74,37 @@ class EMTModel:
         grid_frame = _terrain_to_frame(terrain, self.config)
         ny = terrain.sizes["y"]
         nx = terrain.sizes["x"]
+        mean_col = self.config.mean_moisture_column or "spatial_mean_soil_moisture"
+
+        if isinstance(mean_moisture, xr.DataArray):
+            mean_grid = _align_mean_grid(mean_moisture, terrain)
+            if "time" in mean_grid.dims:
+                arrays = []
+                for it in range(mean_grid.sizes["time"]):
+                    table = grid_frame.copy()
+                    table[mean_col] = np.asarray(mean_grid.isel(time=it).values, dtype=float).ravel()
+                    arrays.append(self.predict_frame(table).reshape(ny, nx))
+                return xr.DataArray(
+                    np.stack(arrays).astype(np.float32),
+                    dims=("time", "y", "x"),
+                    coords={"time": mean_grid.time, "y": terrain.y, "x": terrain.x},
+                    name="emt_soil_moisture",
+                    attrs={"method": "Calibrated EMT anomaly model with spatial mean-moisture forcing"},
+                )
+
+            table = grid_frame.copy()
+            table[mean_col] = np.asarray(mean_grid.values, dtype=float).ravel()
+            predicted = self.predict_frame(table).reshape(ny, nx)
+            return xr.DataArray(
+                predicted.astype(np.float32),
+                dims=("y", "x"),
+                coords={"y": terrain.y, "x": terrain.x},
+                name="emt_soil_moisture",
+                attrs={"method": "Calibrated EMT anomaly model with spatial mean-moisture forcing"},
+            )
 
         if isinstance(mean_moisture, pd.DataFrame):
             date_col = _find_date_column(mean_moisture)
-            mean_col = self.config.mean_moisture_column or "spatial_mean_soil_moisture"
             if mean_col not in mean_moisture:
                 raise ValueError(f"mean_moisture DataFrame is missing {mean_col!r}")
             arrays = []
@@ -96,7 +123,6 @@ class EMTModel:
             )
 
         table = grid_frame.copy()
-        mean_col = self.config.mean_moisture_column or "spatial_mean_soil_moisture"
         table[mean_col] = float(mean_moisture)
         predicted = self.predict_frame(table).reshape(ny, nx)
         return xr.DataArray(
@@ -446,3 +472,18 @@ def _find_date_column(frame: pd.DataFrame) -> str:
         if column in frame:
             return column
     raise ValueError("Could not find a date/time column in mean_moisture DataFrame")
+
+
+def _align_mean_grid(mean_moisture: xr.DataArray, terrain: xr.Dataset) -> xr.DataArray:
+    if {"x", "y"}.issubset(mean_moisture.dims):
+        if not np.array_equal(mean_moisture.x.values, terrain.x.values) or not np.array_equal(
+            mean_moisture.y.values,
+            terrain.y.values,
+        ):
+            return mean_moisture.interp(x=terrain.x, y=terrain.y, method="nearest")
+        return mean_moisture
+
+    if mean_moisture.size == 1:
+        return xr.full_like(terrain[next(iter(terrain.data_vars))], float(mean_moisture), dtype=float)
+
+    raise ValueError("mean_moisture DataArray must have x/y dimensions or contain a scalar value")

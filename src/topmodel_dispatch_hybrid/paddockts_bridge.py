@@ -144,3 +144,42 @@ def load_or_download_silo(
     output_path.parent.mkdir(parents=True, exist_ok=True)
     climate.to_csv(output_path, index=False)
     return climate
+
+
+def load_or_download_smips(
+    query,
+    output_path: str | Path,
+    *,
+    layer: str = "TotalBucketRaw",
+    source: str = "auto",
+    reload: bool = False,
+    paddockts_path: str | Path | None = None,
+) -> xr.DataArray:
+    """Download a SMIPS cube through PaddockTS and cache it as NetCDF."""
+
+    configure_paddockts(paddockts_path)
+    output_path = Path(output_path)
+    if output_path.exists() and not reload:
+        ds = xr.open_dataset(output_path)
+        data_vars = [name for name in ds.data_vars if name != "spatial_ref"]
+        if not data_vars:
+            raise ValueError(f"No SMIPS data variables found in {output_path}")
+        da = ds[data_vars[0]].load()
+        ds.close()
+        return da
+
+    from PaddockTS.Environmental.SMIPS.download_smips import smips_cube
+
+    cube = smips_cube(
+        query.start,
+        query.end,
+        tuple(query.bbox),
+        layer=layer,
+        source=source,
+        skip_missing=True,
+    ).astype(np.float32)
+    cube.name = layer.lower()
+    cube.attrs.setdefault("layer", layer)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    cube.to_dataset(name=cube.name).to_netcdf(output_path)
+    return cube

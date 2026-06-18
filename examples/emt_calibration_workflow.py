@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+from datetime import date
 from pathlib import Path
 
 from topmodel_dispatch_hybrid.observations import ObservationColumns
@@ -32,6 +33,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lower-bound", type=float)
     parser.add_argument("--upper-bound", type=float)
     parser.add_argument("--ridge", type=float, default=1e-6)
+    parser.add_argument("--smips-path", type=Path, help="Existing SMIPS NetCDF to use as EMT forcing.")
+    parser.add_argument("--download-smips", action="store_true", help="Download SMIPS for the AOI/date range.")
+    parser.add_argument(
+        "--smips-layer",
+        default="TotalBucketRaw",
+        choices=["TotalBucketRaw", "SMIndexRaw", "totalbucket", "SMindex", "bucket1", "bucket2"],
+    )
+    parser.add_argument("--smips-source", choices=["auto", "cog", "wms"], default="auto")
+    parser.add_argument(
+        "--smips-mode",
+        choices=["auto", "totalbucket", "relative_fullness"],
+        default="auto",
+        help="How to convert SMIPS values into EMT mean-moisture forcing.",
+    )
+    parser.add_argument("--smips-start", type=date.fromisoformat)
+    parser.add_argument("--smips-end", type=date.fromisoformat)
+    parser.add_argument("--paddockts-path", type=Path)
+    parser.add_argument("--reload-smips", action="store_true")
     return parser.parse_args()
 
 
@@ -66,12 +85,25 @@ def main() -> None:
         lower_bound=args.lower_bound,
         upper_bound=args.upper_bound,
         ridge=args.ridge,
+        smips_path=args.smips_path,
+        download_smips=args.download_smips,
+        smips_layer=args.smips_layer,
+        smips_source=args.smips_source,
+        smips_mode=args.smips_mode,
+        smips_start=args.smips_start,
+        smips_end=args.smips_end,
+        paddockts_path=args.paddockts_path,
+        reload_smips=args.reload_smips,
     )
 
     diagnostics = result.calibration.model.diagnostics
     print(f"Saved point covariates: {result.point_covariates_path}")
     print(f"Saved EMT model: {result.model_path}")
     print(f"Saved prediction grid: {result.prediction_path}")
+    if result.smips_prediction_path is not None:
+        print(f"Saved SMIPS-driven EMT grid: {result.smips_prediction_path}")
+    if result.smips_side_by_side_path is not None:
+        print(f"Saved EMT/SMIPS side-by-side PNG: {result.smips_side_by_side_path}")
     print(
         "Diagnostics: "
         f"n={diagnostics['n_observations']}, "

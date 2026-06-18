@@ -11,6 +11,7 @@ from topmodel_dispatch_hybrid.observations import (
     extract_covariates_at_points,
     load_soil_moisture_csv,
 )
+from topmodel_dispatch_hybrid.smips_integration import smips_to_mean_moisture
 
 
 def test_extract_points_and_calibrate_emt_grid() -> None:
@@ -81,6 +82,58 @@ def test_emt_rejects_bounds_that_do_not_match_observation_units() -> None:
         assert "above upper_bound" in str(exc)
     else:
         raise AssertionError("Expected a ValueError for mismatched EMT bounds")
+
+
+def test_emt_predict_dataset_accepts_spatial_mean_moisture_grid() -> None:
+    terrain = _terrain()
+    observations = _observations_from_terrain(terrain)
+    sampled = extract_covariates_at_points(observations, terrain, coordinate_crs=None)
+    result = calibrate_emt(
+        sampled,
+        EMTConfig(
+            moisture_column="soil_moisture",
+            time_column="date",
+            lower_bound=0.05,
+            upper_bound=0.50,
+        ),
+        terrain=terrain,
+    )
+    mean_grid = xr.DataArray(
+        np.linspace(0.10, 0.35, terrain.sizes["x"] * terrain.sizes["y"]).reshape(terrain["lfi"].shape),
+        dims=("y", "x"),
+        coords={"y": terrain.y, "x": terrain.x},
+    )
+
+    predicted = result.model.predict_dataset(terrain, mean_moisture=mean_grid)
+
+    assert predicted.shape == terrain["lfi"].shape
+    assert float(predicted.std()) > 0.0
+
+
+def test_smips_relative_fullness_maps_to_emt_bounds() -> None:
+    terrain = _terrain()
+    observations = _observations_from_terrain(terrain)
+    sampled = extract_covariates_at_points(observations, terrain, coordinate_crs=None)
+    result = calibrate_emt(
+        sampled,
+        EMTConfig(
+            moisture_column="soil_moisture",
+            time_column="date",
+            lower_bound=0.05,
+            upper_bound=0.50,
+        ),
+    )
+    smips = xr.DataArray(
+        np.array([[0.0, 50.0], [100.0, 25.0]]),
+        dims=("y", "x"),
+        coords={"y": [0.0, 1.0], "x": [0.0, 1.0]},
+        attrs={"layer": "SMIndexRaw"},
+    )
+
+    mean = smips_to_mean_moisture(smips, result.model)
+
+    assert np.isclose(float(mean.min()), 0.05)
+    assert np.isclose(float(mean.max()), 0.50)
 
 
 def _terrain() -> xr.Dataset:

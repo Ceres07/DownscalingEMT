@@ -171,3 +171,55 @@ provides thin adapters around the local `paddock-ts-local` checkout under
 `/Volumes/Dmitry_work/borevitz_projects/paddock-ts-local`. Use those adapters to
 create a PaddockTS query, download terrain covariates, and download SILO climate
 before running the EMT calibration.
+
+### Optional SMIPS Forcing
+
+The base EMT calibration does not require SMIPS. It calibrates a fine-scale
+topographic pattern from point observations and uses the point-observation
+spatial mean as the wetness-state input.
+
+To use SMIPS as the wetness-state driver, pass either an existing SMIPS NetCDF
+or ask the workflow to download one through PaddockTS. The workflow then writes:
+
+- `<stub>_emt_prediction.nc`: EMT using the observation-derived mean state.
+- `<stub>_emt_smips_prediction.nc`: EMT using SMIPS as spatial/time-varying
+  mean-moisture forcing.
+- `<stub>_emt_smips_side_by_side.png`: EMT prediction and the driving SMIPS tile
+  plotted side by side.
+
+For SMIPS total bucket in millimetres:
+
+```bash
+PYTHONPATH=src python examples/emt_calibration_workflow.py \
+  --dem /path/to/aoi_dem.tif \
+  --observations /path/to/soil_moisture_points.csv \
+  --out-dir outputs/emt_test \
+  --moisture-column Water_mm \
+  --time-column Date \
+  --lower-bound 0 \
+  --upper-bound 30 \
+  --download-smips \
+  --smips-layer TotalBucketRaw \
+  --smips-mode totalbucket
+```
+
+For SMIPS relative fullness / SMIndex:
+
+```bash
+PYTHONPATH=src python examples/emt_calibration_workflow.py \
+  --dem /path/to/aoi_dem.tif \
+  --observations /path/to/soil_moisture_points.csv \
+  --out-dir outputs/emt_test \
+  --moisture-column Water_mm \
+  --time-column Date \
+  --lower-bound 0 \
+  --upper-bound 30 \
+  --download-smips \
+  --smips-layer SMIndexRaw \
+  --smips-mode relative_fullness
+```
+
+`TotalBucketRaw` is treated as moisture in the same units as the calibrated EMT
+target. `SMIndexRaw` is treated as relative fullness and mapped into the EMT
+lower/upper bounds. Dates are inferred from the observation time column unless
+`--smips-start` and `--smips-end` are supplied.
