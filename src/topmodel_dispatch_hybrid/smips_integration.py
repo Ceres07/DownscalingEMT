@@ -77,17 +77,58 @@ def predict_emt_from_smips(
     smips: xr.DataArray,
     mode: str = "auto",
     source_crs: str | None = "EPSG:4326",
+    alignment: str = "coarse",
 ) -> xr.DataArray:
     """Predict EMT moisture using SMIPS as a spatial/time wetness-state driver."""
 
     mean_moisture = smips_to_mean_moisture(smips, model, mode=mode)
-    aligned = align_smips_to_terrain(mean_moisture, terrain, source_crs=source_crs)
+    if alignment == "coarse":
+        aligned = align_smips_coarse_to_terrain(mean_moisture, terrain, source_crs=source_crs)
+    elif alignment == "reproject":
+        aligned = align_smips_to_terrain(mean_moisture, terrain, source_crs=source_crs)
+    else:
+        raise ValueError("alignment must be one of 'coarse' or 'reproject'")
     out = model.predict_dataset(terrain, mean_moisture=aligned)
     out.attrs.update(
         smips_mode=aligned.attrs.get("smips_mode", mode),
         smips_layer=smips.attrs.get("layer", smips.name or ""),
         method="Calibrated EMT pattern driven by SMIPS mean-moisture forcing",
     )
+    return out
+
+
+def align_smips_coarse_to_terrain(
+    smips: xr.DataArray,
+    terrain: xr.Dataset,
+    source_crs: str | None = "EPSG:4326",
+) -> xr.DataArray:
+    """Assign each fine terrain cell to its nearest coarse SMIPS cell center."""
+
+    smips = _normalise_xy(smips)
+    smips_x, smips_y = _project_smips_center_axes(smips, terrain, source_crs=source_crs)
+    x_labels = _nearest_index_labels(terrain.x.values.astype(float), smips_x)
+    y_labels = _nearest_index_labels(terrain.y.values.astype(float), smips_y)
+    if "time" in smips.dims:
+        values = np.asarray(smips.transpose("time", "y", "x").values, dtype=float)
+        aligned = values[:, y_labels[:, None], x_labels[None, :]]
+        out = xr.DataArray(
+            aligned.astype(np.float32),
+            dims=("time", "y", "x"),
+            coords={"time": smips.time, "y": terrain.y, "x": terrain.x},
+            name=smips.name,
+            attrs=smips.attrs,
+        )
+    else:
+        values = np.asarray(smips.transpose("y", "x").values, dtype=float)
+        aligned = values[y_labels[:, None], x_labels[None, :]]
+        out = xr.DataArray(
+            aligned.astype(np.float32),
+            dims=("y", "x"),
+            coords={"y": terrain.y, "x": terrain.x},
+            name=smips.name,
+            attrs=smips.attrs,
+        )
+    out.attrs["alignment"] = "nearest coarse SMIPS cell center"
     return out
 
 
@@ -167,3 +208,30 @@ def _normalise_xy(da: xr.DataArray) -> xr.DataArray:
     if "x" not in out.coords or "y" not in out.coords:
         raise ValueError("SMIPS data must have x/y, longitude/latitude, or xc/yc coordinates")
     return out
+
+
+def _project_smips_center_axes(
+    smips: xr.DataArray,
+    terrain: xr.Dataset,
+    source_crs: str | None,
+) -> tuple[np.ndarray, np.ndarray]:
+    x = smips.x.values.astype(float)
+    y = smips.y.values.astype(float)
+    target_crs = terrain.attrs.get("crs") or None
+    if not source_crs or not target_crs or str(source_crs) == str(target_crs):
+        return x, y
+    try:
+        from rasterio.warp import transform
+
+        mean_y = float(np.nanmean(y))
+        mean_x = float(np.nanmean(x))
+        projected_x, _ = transform(source_crs, target_crs, x.tolist(), [mean_y] * len(x))
+        _, projected_y = transform(source_crs, target_crs, [mean_x] * len(y), y.tolist())
+        return np.asarray(projected_x, dtype=float), np.asarray(projected_y, dtype=float)
+    except Exception as exc:
+        raise ValueError("Could not project SMIPS cell centers into the terrain CRS") from exc
+
+
+def _nearest_index_labels(fine: np.ndarray, coarse: np.ndarray) -> np.ndarray:
+    distances = np.abs(fine[:, None] - coarse[None, :])
+    return np.argmin(distances, axis=1)

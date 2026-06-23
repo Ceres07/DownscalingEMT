@@ -223,3 +223,38 @@ PYTHONPATH=src python examples/emt_calibration_workflow.py \
 target. `SMIndexRaw` is treated as relative fullness and mapped into the EMT
 lower/upper bounds. Dates are inferred from the observation time column unless
 `--smips-start` and `--smips-end` are supplied.
+
+## Physical EMT Parameter Calibration
+
+For Coleman and Niemann Table 1-style physical parameters, use the physical EMT
+runner after terrain covariates and point covariates have been created:
+
+```bash
+PYTHONPATH=src python examples/physical_emt_maps.py \
+  --points outputs/emt_test/Esdale_emt_point_covariates.csv \
+  --terrain outputs/emt_test/Esdale_emt_terrain_covariates.nc \
+  --smips outputs/emt_test/Esdale_emt_totalbucketraw_smips.nc \
+  --out-dir outputs/emt_test/physical_emt \
+  --stub Esdale \
+  --maxiter 200
+```
+
+This calibrates `Ks,v`, `Ks,h`, porosity, `eta_h`, `eta_v`, `beta_r`,
+`beta_a`, `alpha`, `z0`, `curvature_min`, and `epsilon` by maximizing average
+spatial NSCE across observation dates. The output includes:
+
+- `<stub>_physical_emt_table1_parameters.md` and `.csv`: paper-style parameter
+  table.
+- `<stub>_physical_emt_calibration_metrics_by_date.csv`: direct point-fit RMSE
+  and NSE for each observation date.
+- `<stub>_physical_emt_smips_map_metrics_by_date.csv`: RMSE and NSE after using
+  SMIPS as the dated wetness-state driver.
+- `<stub>_physical_emt_smips_maps.nc`: dated EMT theta/water maps plus the
+  nearest coarse SMIPS tile forcing.
+- `<stub>_physical_emt_maps/*.png`: one side-by-side EMT and SMIPS PNG for every
+  date in the point dataset.
+
+SMIPS forcing is assigned by nearest coarse SMIPS cell center, so the SMIPS
+layer remains visibly block-aligned to the coarse tiles. The EMT output remains
+fine-grained because the coarse SMIPS water state is redistributed over the DEM
+terrain indices.

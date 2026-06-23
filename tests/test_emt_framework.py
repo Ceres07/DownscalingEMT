@@ -11,7 +11,7 @@ from topmodel_dispatch_hybrid.observations import (
     extract_covariates_at_points,
     load_soil_moisture_csv,
 )
-from topmodel_dispatch_hybrid.smips_integration import smips_to_mean_moisture
+from topmodel_dispatch_hybrid.smips_integration import align_smips_coarse_to_terrain, smips_to_mean_moisture
 
 
 def test_extract_points_and_calibrate_emt_grid() -> None:
@@ -134,6 +134,29 @@ def test_smips_relative_fullness_maps_to_emt_bounds() -> None:
 
     assert np.isclose(float(mean.min()), 0.05)
     assert np.isclose(float(mean.max()), 0.50)
+
+
+def test_align_smips_coarse_to_terrain_preserves_coarse_tiles() -> None:
+    terrain = xr.Dataset(coords={"y": np.linspace(0.0, 2.0, 5), "x": np.linspace(0.0, 2.0, 5)})
+    smips = xr.DataArray(
+        np.array([[[10.0, 20.0], [30.0, 40.0]]]),
+        dims=("time", "y", "x"),
+        coords={"time": [np.datetime64("2025-01-01")], "y": [0.0, 2.0], "x": [0.0, 2.0]},
+    )
+
+    aligned = align_smips_coarse_to_terrain(smips, terrain, source_crs=None)
+
+    expected = np.array(
+        [
+            [10.0, 10.0, 10.0, 20.0, 20.0],
+            [10.0, 10.0, 10.0, 20.0, 20.0],
+            [10.0, 10.0, 10.0, 20.0, 20.0],
+            [30.0, 30.0, 30.0, 40.0, 40.0],
+            [30.0, 30.0, 30.0, 40.0, 40.0],
+        ]
+    )
+    assert aligned.shape == (1, 5, 5)
+    assert np.array_equal(aligned.isel(time=0).values, expected)
 
 
 def _terrain() -> xr.Dataset:
