@@ -12,12 +12,12 @@ import xarray as xr
 
 from topmodel_dispatch_hybrid.physical_emt import (
     calibrate_physical_emt,
-    predict_physical_emt_grid,
+    physical_emt_grid_components,
     score_predictions_by_date,
     write_table1_style_parameter_csv,
     write_table1_style_parameter_set,
 )
-from topmodel_dispatch_hybrid.smips_integration import align_smips_coarse_to_terrain
+from topmodel_dispatch_hybrid.smips_integration import align_smips_coarse_to_terrain, smips_coarse_cell_labels
 
 
 def parse_args() -> argparse.Namespace:
@@ -31,6 +31,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--water-column", default="Water_mm")
     parser.add_argument("--time-column", default="Date")
     parser.add_argument("--maxiter", type=int, default=200)
+    parser.add_argument("--mean-sample-size", type=int, default=20000)
     parser.add_argument("--seed", type=int, default=42)
     return parser.parse_args()
 
@@ -51,6 +52,7 @@ def main() -> None:
         time_column=args.time_column,
         seed=args.seed,
         maxiter=args.maxiter,
+        mean_sample_size=args.mean_sample_size,
     )
     calibration.to_json(args.out_dir / f"{args.stub}_physical_emt_parameters.json")
     write_table1_style_parameter_csv(
@@ -70,9 +72,16 @@ def main() -> None:
     smips_aligned_mm = align_smips_coarse_to_terrain(smips_dates, terrain, source_crs="EPSG:4326").rename(
         "smips_totalbucket_mm"
     )
+    smips_labels = smips_coarse_cell_labels(smips_dates, terrain, source_crs="EPSG:4326")
     theta_bar = (smips_aligned_mm / calibration.water_depth_mm).clip(0.0, calibration.parameters.porosity * 0.999)
     theta_bar = theta_bar.rename("smips_theta_bar")
-    predicted_theta = predict_physical_emt_grid(terrain, calibration.parameters, theta_bar=theta_bar)
+    components = physical_emt_grid_components(
+        terrain,
+        calibration.parameters,
+        theta_bar=theta_bar,
+        normalization_labels=smips_labels,
+    )
+    predicted_theta = components["physical_emt_theta"]
     predicted_water = (predicted_theta * calibration.water_depth_mm).rename("physical_emt_water_mm")
     predicted_water.attrs["units"] = "mm"
 
@@ -82,6 +91,12 @@ def main() -> None:
     map_metrics["rmse_water_mm"] = map_metrics["rmse_theta"] * calibration.water_depth_mm
     map_metrics.to_csv(args.out_dir / f"{args.stub}_physical_emt_smips_map_metrics_by_date.csv", index=False)
 
+    process_weight_summary = _process_weight_summary(components)
+    process_weight_summary.to_csv(
+        args.out_dir / f"{args.stub}_physical_emt_process_weights_by_date.csv",
+        index=False,
+    )
+
     ds_out = xr.Dataset(
         {
             "physical_emt_theta": predicted_theta,
@@ -90,12 +105,31 @@ def main() -> None:
             "smips_theta_bar": theta_bar,
         },
         attrs={
-            "method": "Physical EMT driven by nearest coarse SMIPS total bucket tile",
+            "method": "Physical EMT equation 7/19 driven by nearest coarse SMIPS total bucket tile",
             "water_depth_mm": calibration.water_depth_mm,
+            "normalization": "LFI/ETI means computed within each nearest coarse SMIPS tile",
+        },
+    )
+    weights_out = xr.Dataset(
+        {
+            "relative_w_g": components["relative_w_g"],
+            "relative_w_l": components["relative_w_l"],
+            "relative_w_r": components["relative_w_r"],
+            "relative_w_a": components["relative_w_a"],
+            "normalization_label": components["normalization_label"],
+        },
+        attrs={
+            "method": "Relative physical EMT process weights from equation 7/19",
+            "deep_drainage": "relative_w_g",
+            "lateral_flow": "relative_w_l",
+            "radiative_et": "relative_w_r",
+            "aerodynamic_et": "relative_w_a",
         },
     )
     nc_path = args.out_dir / f"{args.stub}_physical_emt_smips_maps.nc"
+    weights_path = args.out_dir / f"{args.stub}_physical_emt_process_weights.nc"
     ds_out.to_netcdf(nc_path)
+    weights_out.to_netcdf(weights_path)
 
     png_dir = args.out_dir / f"{args.stub}_physical_emt_maps"
     png_dir.mkdir(parents=True, exist_ok=True)
@@ -113,6 +147,7 @@ def main() -> None:
     print(f"Saved Table 1-style parameters: {args.out_dir / f'{args.stub}_physical_emt_table1_parameters.md'}")
     print(f"Saved per-date metrics: {args.out_dir / f'{args.stub}_physical_emt_smips_map_metrics_by_date.csv'}")
     print(f"Saved maps: {nc_path}")
+    print(f"Saved process weights: {weights_path}")
     print(f"Saved PNG directory: {png_dir}")
 
 
@@ -138,6 +173,21 @@ def _sample_predictions_at_points(points: pd.DataFrame, predicted: xr.DataArray,
         sampled = predicted.sel(time=time_value).sel(x=x[mask.to_numpy()], y=y[mask.to_numpy()], method="nearest")
         values[np.where(mask.to_numpy())[0]] = sampled.values
     return values
+
+
+def _process_weight_summary(components: xr.Dataset) -> pd.DataFrame:
+    rows = []
+    for index, date_value in enumerate(pd.to_datetime(components.time.values)):
+        rows.append(
+            {
+                "date": date_value.date().isoformat(),
+                "deep_drainage_weight": float(np.nanmean(components["relative_w_g"].isel(time=index).values)),
+                "lateral_flow_weight": float(np.nanmean(components["relative_w_l"].isel(time=index).values)),
+                "radiative_et_weight": float(np.nanmean(components["relative_w_r"].isel(time=index).values)),
+                "aerodynamic_et_weight": float(np.nanmean(components["relative_w_a"].isel(time=index).values)),
+            }
+        )
+    return pd.DataFrame(rows)
 
 
 def _plot_date_map(

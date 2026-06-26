@@ -59,7 +59,7 @@ PAPER_PARAMETER_ROWS = (
     ("beta_a", "0.2-5.0"),
     ("alpha", "0.26 fixed"),
     ("z0", "calibrated effective soil thickness, m"),
-    ("curvature_min", "-1e-6 to -1e-1 m^-1"),
+    ("curvature_min", "-1e6 to catchment minimum m^-1"),
     ("epsilon", "1-3"),
 )
 
@@ -75,6 +75,7 @@ def calibrate_physical_emt(
     pet: float | None = None,
     seed: int = 42,
     maxiter: int = 200,
+    mean_sample_size: int | None = 20000,
 ) -> PhysicalEMTCalibration:
     """Calibrate the physical EMT parameter set by maximizing average NSCE."""
 
@@ -87,12 +88,13 @@ def calibrate_physical_emt(
         theta_is_percent=theta_is_percent,
         water_column=water_column,
         time_column=time_column,
+        mean_sample_size=mean_sample_size,
     )
     pet_value = float(pet) if pet is not None else _estimate_pet(point_table)
 
     def objective(vector: np.ndarray) -> float:
         params = _unpack_parameters(vector, pet=pet_value)
-        penalty = _parameter_penalty(params)
+        penalty = _parameter_penalty(params, min_curvature=data.min_curvature)
         if penalty > 0:
             return penalty
         predicted = predict_physical_emt_points(data, params)
@@ -111,7 +113,7 @@ def calibrate_physical_emt(
         (0.2, 5.0),
         (0.2, 5.0),
         (np.log10(0.05), np.log10(2.0)),
-        (-6.0, -1.0),
+        (-6.0, 6.0),
         (1.0, 3.0),
     ]
     result = differential_evolution(
@@ -146,6 +148,7 @@ def calibrate_physical_emt(
 
 
 def predict_physical_emt_points(data: "_PreparedPhysicalData", params: PhysicalEMTParameters) -> np.ndarray:
+    ip_mean = _finite_mean(data.mean_hli)
     lfi = physical_lfi(
         flow_acc=data.flow_acc,
         slope_degrees=data.slope,
@@ -153,13 +156,28 @@ def predict_physical_emt_points(data: "_PreparedPhysicalData", params: PhysicalE
         eta_h=params.eta_h,
         epsilon=params.epsilon,
         curvature_min=params.curvature_min,
+        specific_area_scale=data.specific_area_scale,
     )
-    eti = physical_eti(data.hli, beta_r=params.beta_r)
+    lfi_mean = _finite_mean(
+        physical_lfi(
+            flow_acc=data.mean_flow_acc,
+            slope_degrees=data.mean_slope,
+            curvature=data.mean_curvature,
+            eta_h=params.eta_h,
+            epsilon=params.epsilon,
+            curvature_min=params.curvature_min,
+            specific_area_scale=data.specific_area_scale,
+        )
+    )
+    eti = physical_eti(data.hli, beta_r=params.beta_r, ip_mean=ip_mean)
+    eti_mean = _finite_mean(physical_eti(data.mean_hli, beta_r=params.beta_r, ip_mean=ip_mean))
     return physical_emt_prediction(
         theta_bar=data.theta_bar,
         lfi=lfi,
         eti=eti,
         params=params,
+        lfi_mean=lfi_mean,
+        eti_mean=eti_mean,
     )
 
 
@@ -167,11 +185,29 @@ def predict_physical_emt_grid(
     terrain: xr.Dataset,
     params: PhysicalEMTParameters,
     theta_bar: xr.DataArray,
+    normalization_labels: xr.DataArray | None = None,
 ) -> xr.DataArray:
     """Predict physical EMT theta over a terrain grid."""
 
+    return physical_emt_grid_components(
+        terrain,
+        params,
+        theta_bar,
+        normalization_labels=normalization_labels,
+    )["physical_emt_theta"]
+
+
+def physical_emt_grid_components(
+    terrain: xr.Dataset,
+    params: PhysicalEMTParameters,
+    theta_bar: xr.DataArray,
+    normalization_labels: xr.DataArray | None = None,
+) -> xr.Dataset:
+    """Evaluate paper EMT equation 7/19 and process weights over a terrain grid."""
+
     theta_bar = _align_theta_bar(theta_bar, terrain)
     curvature = terrain_curvature(terrain)
+    specific_area_scale = _specific_area_scale(terrain)
     lfi = physical_lfi(
         flow_acc=terrain["flow_acc"].values,
         slope_degrees=terrain["slope"].values,
@@ -179,41 +215,92 @@ def predict_physical_emt_grid(
         eta_h=params.eta_h,
         epsilon=params.epsilon,
         curvature_min=params.curvature_min,
+        specific_area_scale=specific_area_scale,
     )
-    eti = physical_eti(terrain["hli"].values, beta_r=params.beta_r)
+    ip_mean = _finite_mean(terrain["hli"].values)
+    eti = physical_eti(terrain["hli"].values, beta_r=params.beta_r, ip_mean=ip_mean)
+    lfi_mean, eti_mean = _index_means_for_grid(lfi, eti, normalization_labels)
     lfi_da = xr.DataArray(lfi, dims=("y", "x"), coords={"y": terrain.y, "x": terrain.x})
     eti_da = xr.DataArray(eti, dims=("y", "x"), coords={"y": terrain.y, "x": terrain.x})
+
+    component_names = (
+        "theta",
+        "theta_g",
+        "theta_l",
+        "theta_r",
+        "theta_a",
+        "w_g",
+        "w_l",
+        "w_r",
+        "w_a",
+        "relative_w_g",
+        "relative_w_l",
+        "relative_w_r",
+        "relative_w_a",
+    )
     if "time" in theta_bar.dims:
-        arrays = []
+        arrays: dict[str, list[np.ndarray]] = {name: [] for name in component_names}
         for it in range(theta_bar.sizes["time"]):
-            pred = physical_emt_prediction(
+            components = physical_emt_components(
                 theta_bar=theta_bar.isel(time=it).values,
                 lfi=lfi_da.values,
                 eti=eti_da.values,
                 params=params,
+                lfi_mean=lfi_mean,
+                eti_mean=eti_mean,
             )
-            arrays.append(pred.astype(np.float32))
-        return xr.DataArray(
-            np.stack(arrays),
-            dims=("time", "y", "x"),
+            for name in component_names:
+                arrays[name].append(np.asarray(components[name], dtype=np.float32))
+        data_vars = {
+            _component_var_name(name): (
+                ("time", "y", "x"),
+                np.stack(values).astype(np.float32),
+                _component_attrs(name),
+            )
+            for name, values in arrays.items()
+        }
+        ds = xr.Dataset(
+            data_vars,
             coords={"time": theta_bar.time, "y": terrain.y, "x": terrain.x},
-            name="physical_emt_theta",
-            attrs={"units": "m3 m-3"},
+            attrs={"method": "Coleman-Niemann physical EMT equation 7/19"},
+        )
+    else:
+        components = physical_emt_components(
+            theta_bar=theta_bar.values,
+            lfi=lfi_da.values,
+            eti=eti_da.values,
+            params=params,
+            lfi_mean=lfi_mean,
+            eti_mean=eti_mean,
+        )
+        ds = xr.Dataset(
+            {
+                _component_var_name(name): (
+                    ("y", "x"),
+                    np.asarray(components[name], dtype=np.float32),
+                    _component_attrs(name),
+                )
+                for name in component_names
+            },
+            coords={"y": terrain.y, "x": terrain.x},
+            attrs={"method": "Coleman-Niemann physical EMT equation 7/19"},
         )
 
-    pred = physical_emt_prediction(
-        theta_bar=theta_bar.values,
-        lfi=lfi_da.values,
-        eti=eti_da.values,
-        params=params,
-    )
-    return xr.DataArray(
-        pred.astype(np.float32),
+    ds["lfi_index"] = lfi_da.astype(np.float32)
+    ds["eti_index"] = eti_da.astype(np.float32)
+    ds["lfi_mean"] = xr.DataArray(
+        np.asarray(np.broadcast_to(lfi_mean, lfi.shape), dtype=np.float32),
         dims=("y", "x"),
         coords={"y": terrain.y, "x": terrain.x},
-        name="physical_emt_theta",
-        attrs={"units": "m3 m-3"},
     )
+    ds["eti_mean"] = xr.DataArray(
+        np.asarray(np.broadcast_to(eti_mean, eti.shape), dtype=np.float32),
+        dims=("y", "x"),
+        coords={"y": terrain.y, "x": terrain.x},
+    )
+    if normalization_labels is not None:
+        ds["normalization_label"] = normalization_labels.astype(np.int32)
+    return ds
 
 
 def physical_emt_prediction(
@@ -221,24 +308,66 @@ def physical_emt_prediction(
     lfi: np.ndarray,
     eti: np.ndarray,
     params: PhysicalEMTParameters,
+    lfi_mean: np.ndarray | float | None = None,
+    eti_mean: np.ndarray | float | None = None,
 ) -> np.ndarray:
     """Explicit physical EMT estimate from weighted process-limit estimates."""
 
+    return physical_emt_components(theta_bar, lfi, eti, params, lfi_mean=lfi_mean, eti_mean=eti_mean)["theta"]
+
+
+def physical_emt_components(
+    theta_bar: np.ndarray | float,
+    lfi: np.ndarray,
+    eti: np.ndarray,
+    params: PhysicalEMTParameters,
+    lfi_mean: np.ndarray | float | None = None,
+    eti_mean: np.ndarray | float | None = None,
+) -> dict[str, np.ndarray]:
+    """Evaluate equation 7/19 and return process estimates and weights.
+
+    ``theta_bar`` is the spatial-average moisture state. ``lfi_mean`` is
+    Coleman and Niemann's Lambda, and ``eti_mean`` is Pi. For SMIPS
+    downscaling these can be supplied as coarse-tile mean grids so each SMIPS
+    tile is mass-normalized independently.
+    """
+
     theta_bar_arr = np.asarray(theta_bar, dtype=float)
     theta_bar_arr = np.clip(theta_bar_arr, 1e-6, params.porosity * 0.999)
-    lfi_norm = _normalise_pattern(lfi)
-    eti_norm = _normalise_pattern(eti)
-    theta_l = theta_bar_arr * lfi_norm
-    theta_r = theta_bar_arr * eti_norm
+    lfi_arr = np.asarray(lfi, dtype=float)
+    eti_arr = np.asarray(eti, dtype=float)
+    lambda_arr = _safe_positive_mean(lfi_arr if lfi_mean is None else lfi_mean)
+    pi_arr = _safe_positive_mean(eti_arr if eti_mean is None else eti_mean)
+    theta_g = theta_bar_arr
+    theta_l = theta_bar_arr * lfi_arr / lambda_arr
+    theta_r = theta_bar_arr * eti_arr / pi_arr
+    theta_a = theta_bar_arr
     rel = np.clip(theta_bar_arr / params.porosity, 1e-6, 0.999)
 
     w_g = params.ks_v * rel**params.eta_v
-    w_l = params.z0 * params.ks_h * rel**params.eta_h
-    w_r = params.pet / (1.0 + params.alpha) * rel**params.beta_r
+    w_l = params.z0 * params.ks_h / (lambda_arr**params.eta_h) * rel**params.eta_h
+    w_r = params.pet / ((1.0 + params.alpha) * (pi_arr**params.beta_r)) * rel**params.beta_r
     w_a = params.pet * params.alpha / (1.0 + params.alpha) * rel**params.beta_a
     denom = w_g + w_l + w_r + w_a
-    pred = ((w_g + w_a) * theta_bar_arr + w_l * theta_l + w_r * theta_r) / denom
-    return np.clip(pred, 0.0, params.porosity)
+    pred = (w_g * theta_g + w_l * theta_l + w_r * theta_r + w_a * theta_a) / denom
+    pred = np.clip(pred, 0.0, params.porosity)
+    return {
+        "theta": pred,
+        "theta_g": theta_g,
+        "theta_l": theta_l,
+        "theta_r": theta_r,
+        "theta_a": theta_a,
+        "w_g": w_g,
+        "w_l": w_l,
+        "w_r": w_r,
+        "w_a": w_a,
+        "relative_w_g": w_g / denom,
+        "relative_w_l": w_l / denom,
+        "relative_w_r": w_r / denom,
+        "relative_w_a": w_a / denom,
+        "lfi_mean": lambda_arr,
+        "eti_mean": pi_arr,
+    }
 
 
 def physical_lfi(
@@ -248,10 +377,11 @@ def physical_lfi(
     eta_h: float,
     epsilon: float,
     curvature_min: float,
+    specific_area_scale: float = 1.0,
 ) -> np.ndarray:
     slope = np.tan(np.radians(np.asarray(slope_degrees, dtype=float)))
     slope = np.clip(slope, 1e-4, None)
-    area = np.clip(np.asarray(flow_acc, dtype=float), 1.0, None)
+    area = np.clip(np.asarray(flow_acc, dtype=float) * float(specific_area_scale), 1.0, None)
     curv = np.asarray(curvature, dtype=float)
     denom = curvature_min - curv
     with np.errstate(divide="ignore", invalid="ignore"):
@@ -262,9 +392,12 @@ def physical_lfi(
     return np.where(np.isfinite(raw), raw, np.nan)
 
 
-def physical_eti(hli: np.ndarray, beta_r: float) -> np.ndarray:
+def physical_eti(hli: np.ndarray, beta_r: float, ip_mean: float | None = None) -> np.ndarray:
     ip = np.asarray(hli, dtype=float)
-    ip = ip / np.nanmean(ip)
+    scale = _finite_mean(ip) if ip_mean is None else float(ip_mean)
+    if not np.isfinite(scale) or scale <= 0:
+        scale = 1.0
+    ip = ip / scale
     ip = np.clip(ip, 1e-6, None)
     raw = (1.0 / ip) ** (1.0 / beta_r)
     return np.where(np.isfinite(raw), raw, np.nan)
@@ -396,6 +529,12 @@ class _PreparedPhysicalData:
     slope: np.ndarray
     hli: np.ndarray
     curvature: np.ndarray
+    mean_flow_acc: np.ndarray
+    mean_slope: np.ndarray
+    mean_hli: np.ndarray
+    mean_curvature: np.ndarray
+    specific_area_scale: float
+    min_curvature: float
     water_depth_mm: float
 
 
@@ -407,6 +546,7 @@ def _prepare_point_data(
     theta_is_percent: bool,
     water_column: str,
     time_column: str,
+    mean_sample_size: int | None,
 ) -> _PreparedPhysicalData:
     frame = point_table.copy()
     theta = pd.to_numeric(frame[theta_column], errors="coerce").to_numpy(dtype=float)
@@ -419,6 +559,7 @@ def _prepare_point_data(
     depth = float(np.nanmedian(water / theta))
 
     curvature = terrain_curvature(terrain)
+    mean_sample = _terrain_mean_sample(terrain, curvature, max_cells=mean_sample_size)
     x = xr.DataArray(frame["_terrain_x"].to_numpy(dtype=float), dims="observation")
     y = xr.DataArray(frame["_terrain_y"].to_numpy(dtype=float), dims="observation")
     sampled_curvature = curvature.sel(x=x, y=y, method="nearest").values
@@ -430,6 +571,12 @@ def _prepare_point_data(
         slope=frame["slope"].to_numpy(dtype=float),
         hli=frame["hli"].to_numpy(dtype=float),
         curvature=np.asarray(sampled_curvature, dtype=float),
+        mean_flow_acc=mean_sample["flow_acc"],
+        mean_slope=mean_sample["slope"],
+        mean_hli=mean_sample["hli"],
+        mean_curvature=mean_sample["curvature"],
+        specific_area_scale=_specific_area_scale(terrain),
+        min_curvature=float(np.nanmin(curvature.values)),
         water_depth_mm=depth,
     )
 
@@ -451,12 +598,14 @@ def _unpack_parameters(vector: np.ndarray, pet: float) -> PhysicalEMTParameters:
     )
 
 
-def _parameter_penalty(params: PhysicalEMTParameters) -> float:
+def _parameter_penalty(params: PhysicalEMTParameters, *, min_curvature: float | None = None) -> float:
     penalty = 0.0
     if params.ks_h < params.ks_v:
         penalty += 1e5 + (params.ks_v - params.ks_h)
     if params.beta_r > params.eta_h:
         penalty += 1e5 + (params.beta_r - params.eta_h)
+    if min_curvature is not None and np.isfinite(min_curvature) and params.curvature_min >= min_curvature:
+        penalty += 1e5 + (params.curvature_min - min_curvature + 1e-9) * 1e8
     return penalty
 
 
@@ -471,14 +620,6 @@ def _estimate_pet(point_table: pd.DataFrame) -> float:
     return 4.0
 
 
-def _normalise_pattern(values: np.ndarray) -> np.ndarray:
-    arr = np.asarray(values, dtype=float)
-    mean = np.nanmean(arr)
-    if not np.isfinite(mean) or abs(mean) < 1e-12:
-        return np.ones_like(arr, dtype=float)
-    return np.where(np.isfinite(arr), arr / mean, 1.0)
-
-
 def _align_theta_bar(theta_bar: xr.DataArray, terrain: xr.Dataset) -> xr.DataArray:
     if {"x", "y"}.issubset(theta_bar.dims):
         if not np.array_equal(theta_bar.x.values, terrain.x.values) or not np.array_equal(
@@ -487,6 +628,94 @@ def _align_theta_bar(theta_bar: xr.DataArray, terrain: xr.Dataset) -> xr.DataArr
         ):
             return theta_bar.interp(x=terrain.x, y=terrain.y, method="nearest")
     return theta_bar
+
+
+def _component_var_name(name: str) -> str:
+    if name == "theta":
+        return "physical_emt_theta"
+    return name
+
+
+def _component_attrs(name: str) -> dict[str, str]:
+    if name.startswith("theta") or name == "theta":
+        return {"units": "m3 m-3"}
+    if name.startswith("relative_w"):
+        return {"units": "1", "long_name": "relative process weight"}
+    if name.startswith("w_"):
+        return {"units": "model process weight"}
+    return {}
+
+
+def _index_means_for_grid(
+    lfi: np.ndarray,
+    eti: np.ndarray,
+    normalization_labels: xr.DataArray | None,
+) -> tuple[np.ndarray | float, np.ndarray | float]:
+    if normalization_labels is None:
+        return _finite_mean(lfi), _finite_mean(eti)
+    labels = np.asarray(normalization_labels.values, dtype=np.int64)
+    return _mean_by_label(lfi, labels), _mean_by_label(eti, labels)
+
+
+def _mean_by_label(values: np.ndarray, labels: np.ndarray) -> np.ndarray:
+    vals = np.asarray(values, dtype=float)
+    labs = np.asarray(labels, dtype=np.int64)
+    valid = np.isfinite(vals) & (labs >= 0)
+    if not valid.any():
+        return np.ones_like(vals, dtype=float)
+    max_label = int(np.nanmax(labs[valid]))
+    sums = np.bincount(labs[valid].ravel(), weights=vals[valid].ravel(), minlength=max_label + 1)
+    counts = np.bincount(labs[valid].ravel(), minlength=max_label + 1)
+    means = sums / np.maximum(counts, 1)
+    global_mean = _finite_mean(vals)
+    means = np.where(counts > 0, means, global_mean)
+    out = np.full(vals.shape, global_mean, dtype=float)
+    out[valid] = means[labs[valid]]
+    return _safe_positive_mean(out)
+
+
+def _terrain_mean_sample(
+    terrain: xr.Dataset,
+    curvature: xr.DataArray,
+    *,
+    max_cells: int | None,
+) -> dict[str, np.ndarray]:
+    total = terrain.sizes["x"] * terrain.sizes["y"]
+    if max_cells is None or max_cells <= 0 or total <= max_cells:
+        stride = 1
+    else:
+        stride = int(np.ceil(np.sqrt(total / max_cells)))
+    slicer = (slice(None, None, stride), slice(None, None, stride))
+    return {
+        "flow_acc": np.asarray(terrain["flow_acc"].values[slicer], dtype=float).ravel(),
+        "slope": np.asarray(terrain["slope"].values[slicer], dtype=float).ravel(),
+        "hli": np.asarray(terrain["hli"].values[slicer], dtype=float).ravel(),
+        "curvature": np.asarray(curvature.values[slicer], dtype=float).ravel(),
+    }
+
+
+def _specific_area_scale(terrain: xr.Dataset) -> float:
+    x = terrain.x.values.astype(float)
+    y = terrain.y.values.astype(float)
+    dx = abs(float(np.nanmedian(np.diff(x)))) if x.size > 1 else 1.0
+    dy = abs(float(np.nanmedian(np.diff(y)))) if y.size > 1 else dx
+    return float(np.sqrt(dx * dy))
+
+
+def _finite_mean(values: np.ndarray) -> float:
+    arr = np.asarray(values, dtype=float)
+    mean = float(np.nanmean(arr))
+    if not np.isfinite(mean):
+        return 1.0
+    return mean
+
+
+def _safe_positive_mean(values: np.ndarray | float) -> np.ndarray | float:
+    arr = np.asarray(values, dtype=float)
+    if arr.ndim == 0:
+        value = float(arr)
+        return value if np.isfinite(value) and value > 1e-12 else 1.0
+    return np.where(np.isfinite(arr) & (arr > 1e-12), arr, 1.0)
 
 
 def _parameter_table_values(params: PhysicalEMTParameters) -> dict[str, float]:

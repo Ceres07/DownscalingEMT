@@ -132,6 +132,27 @@ def align_smips_coarse_to_terrain(
     return out
 
 
+def smips_coarse_cell_labels(
+    smips: xr.DataArray,
+    terrain: xr.Dataset,
+    source_crs: str | None = "EPSG:4326",
+) -> xr.DataArray:
+    """Return integer coarse SMIPS-cell labels for each terrain-grid cell."""
+
+    smips = _normalise_xy(smips)
+    smips_x, smips_y = _project_smips_center_axes(smips, terrain, source_crs=source_crs)
+    x_labels = _nearest_index_labels(terrain.x.values.astype(float), smips_x)
+    y_labels = _nearest_index_labels(terrain.y.values.astype(float), smips_y)
+    labels = y_labels[:, None] * smips.sizes["x"] + x_labels[None, :]
+    return xr.DataArray(
+        labels.astype(np.int32),
+        dims=("y", "x"),
+        coords={"y": terrain.y, "x": terrain.x},
+        name="smips_coarse_cell_label",
+        attrs={"alignment": "nearest coarse SMIPS cell center"},
+    )
+
+
 def plot_emt_smips_side_by_side(
     emt: xr.DataArray,
     smips: xr.DataArray,

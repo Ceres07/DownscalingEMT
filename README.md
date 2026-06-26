@@ -241,7 +241,13 @@ PYTHONPATH=src python examples/physical_emt_maps.py \
 
 This calibrates `Ks,v`, `Ks,h`, porosity, `eta_h`, `eta_v`, `beta_r`,
 `beta_a`, `alpha`, `z0`, `curvature_min`, and `epsilon` by maximizing average
-spatial NSCE across observation dates. The output includes:
+spatial NSCE across observation dates. Predictions use Coleman and Niemann's
+equation 7/19 structure: the coarse/date moisture state sets the relative
+process weights for deep drainage, lateral flow, radiative ET, and aerodynamic
+ET, while LFI and ETI supply the spatially varying estimates. For SMIPS
+downscaling, LFI/ETI means are computed within each nearest coarse SMIPS tile so
+the relative wetness pattern is normalized to the tile moisture state. The
+output includes:
 
 - `<stub>_physical_emt_table1_parameters.md` and `.csv`: paper-style parameter
   table.
@@ -249,8 +255,12 @@ spatial NSCE across observation dates. The output includes:
   and NSE for each observation date.
 - `<stub>_physical_emt_smips_map_metrics_by_date.csv`: RMSE and NSE after using
   SMIPS as the dated wetness-state driver.
+- `<stub>_physical_emt_process_weights_by_date.csv`: Figure 6-style mean
+  relative process weights for every date.
 - `<stub>_physical_emt_smips_maps.nc`: dated EMT theta/water maps plus the
   nearest coarse SMIPS tile forcing.
+- `<stub>_physical_emt_process_weights.nc`: gridded relative weights for deep
+  drainage, lateral flow, radiative ET, and aerodynamic ET.
 - `<stub>_physical_emt_maps/*.png`: one side-by-side EMT and SMIPS PNG for every
   date in the point dataset.
 

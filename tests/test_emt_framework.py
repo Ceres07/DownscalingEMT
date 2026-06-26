@@ -11,7 +11,12 @@ from topmodel_dispatch_hybrid.observations import (
     extract_covariates_at_points,
     load_soil_moisture_csv,
 )
-from topmodel_dispatch_hybrid.smips_integration import align_smips_coarse_to_terrain, smips_to_mean_moisture
+from topmodel_dispatch_hybrid.physical_emt import PhysicalEMTParameters, physical_emt_grid_components
+from topmodel_dispatch_hybrid.smips_integration import (
+    align_smips_coarse_to_terrain,
+    smips_coarse_cell_labels,
+    smips_to_mean_moisture,
+)
 
 
 def test_extract_points_and_calibrate_emt_grid() -> None:
@@ -157,6 +162,54 @@ def test_align_smips_coarse_to_terrain_preserves_coarse_tiles() -> None:
     )
     assert aligned.shape == (1, 5, 5)
     assert np.array_equal(aligned.isel(time=0).values, expected)
+
+
+def test_physical_emt_process_weights_sum_to_one_with_coarse_labels() -> None:
+    y = np.arange(4, dtype=float)
+    x = np.arange(5, dtype=float)
+    yy, xx = np.meshgrid(y, x, indexing="ij")
+    terrain = xr.Dataset(
+        {
+            "dem": (("y", "x"), 100.0 + yy + 0.2 * xx),
+            "flow_acc": (("y", "x"), 1.0 + xx + yy),
+            "slope": (("y", "x"), np.full((4, 5), 5.0)),
+            "hli": (("y", "x"), 0.8 + 0.05 * xx),
+        },
+        coords={"y": y, "x": x},
+    )
+    smips = xr.DataArray(
+        np.array([[0.15, 0.25], [0.20, 0.30]]),
+        dims=("y", "x"),
+        coords={"y": [0.0, 3.0], "x": [0.0, 4.0]},
+    )
+    labels = smips_coarse_cell_labels(smips, terrain, source_crs=None)
+    theta_bar = align_smips_coarse_to_terrain(smips, terrain, source_crs=None)
+    params = PhysicalEMTParameters(
+        ks_v=100.0,
+        ks_h=1000.0,
+        porosity=0.4,
+        eta_h=5.0,
+        eta_v=10.0,
+        beta_r=2.0,
+        beta_a=2.0,
+        alpha=0.26,
+        z0=0.2,
+        curvature_min=-0.01,
+        epsilon=1.0,
+        pet=4.0,
+    )
+
+    components = physical_emt_grid_components(terrain, params, theta_bar, normalization_labels=labels)
+    weight_sum = (
+        components["relative_w_g"].values
+        + components["relative_w_l"].values
+        + components["relative_w_r"].values
+        + components["relative_w_a"].values
+    )
+
+    assert components["physical_emt_theta"].shape == terrain["dem"].shape
+    assert np.allclose(weight_sum, 1.0)
+    assert len(np.unique(labels.values)) == 4
 
 
 def _terrain() -> xr.Dataset:
